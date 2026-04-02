@@ -6,6 +6,7 @@
     var wctx = waveCanvas.getContext('2d');
     sctx.imageSmoothingEnabled = false;
     var analyser = null, timeArray = null, freqArray = null, visLoopOn = false;
+    var waveDirty = true, waveLastW = 0, waveLastH = 0;
     var TARGET_FFT = 8192*2, MIN_HZ = 20, rowToBin = null;
     var specColImage = null, specColData = null, specColHeight = 0;
     var specColCanvas = null, specColCtx = null;
@@ -45,6 +46,7 @@
       var a = resizeCanvasToDisplaySize(specCanvas, { preserve: true, anchorRight: true });
       var b = resizeCanvasToDisplaySize(waveCanvas);
       if (a) sctx.imageSmoothingEnabled = false;
+      if (b) waveDirty = true;
       if ((a || b) && analyser && audioCtx) {
         rowToBin = buildRowToBin(specCanvas.height, audioCtx.sampleRate, analyser.fftSize, MIN_HZ);
       }
@@ -177,85 +179,52 @@
       });
     })();
     function renderWave() {
-      // lazy-init visualization state so no global edit is needed
-      if (!window.vis) window.vis = {
-        normalize: true,
-        targetPeak: 0.95,
-        gain: 1.0,
-        gainSmooth: 0.9,  // 0.9–0.98 = steadier
-        dcBlock: true,
-        trigger: true,
-        trigLevel: 0.0,
-        trigHyst: 0.02,
-        trigSearch: 2048
-      };
-
       var w = waveCanvas.width, h = waveCanvas.height;
+      if (w <= 0 || h <= 0) return;
+      if (!waveDirty && w === waveLastW && h === waveLastH) return;
+      waveDirty = false;
+      waveLastW = w; waveLastH = h;
+
       wctx.clearRect(0, 0, w, h);
-      if (!analyser || !timeArray) return;
-
-      // 1) grab frame
-      analyser.getFloatTimeDomainData(timeArray);
-
-      // 2) stats + optional DC block
-      var stats = frameStats(timeArray);
-      var mean = vis.dcBlock ? stats.mean : 0;
-
-      // 3) peak normalization (smoothed)
-      if (vis.normalize) {
-        var eps = 1e-6;
-        var desired = vis.targetPeak / Math.max(eps, stats.peak);
-        vis.gain = vis.gain * vis.gainSmooth + desired * (1 - vis.gainSmooth);
-      } else {
-        vis.gain = 1.0;
-      }
-
-      // 4) optional trigger to stabilize phase
-      var startIdx = 0;
-      if (vis.trigger) {
-        startIdx = findRisingTrigger(timeArray, vis.trigLevel + mean, vis.trigHyst, vis.trigSearch);
-      }
-
-      // 5) draw
       wctx.lineWidth = Math.max(1, Math.floor(dpr));
       wctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--ok') || '#2ec27e';
-      wctx.beginPath();
 
-      var samples = timeArray.length;
-      var remain = samples - startIdx;
-      var step = Math.max(1, remain / w);
+      if (!Array.isArray(bank) || bank.length === 0) return;
 
+      var twoPi = Math.PI * 2;
+      var denom = Math.max(1, w - 1);
+      var vals = new Float32Array(w);
+      var peak = 0;
+
+      // Show computed wave from current harmonic amplitudes.
       for (var x = 0; x < w; x++) {
-        var i = (startIdx + x * step) | 0;
-        if (i >= samples) break;
-        var v = (timeArray[i] - mean) * vis.gain;
-        if (v > 1) v = 1; else if (v < -1) v = -1; // clamp
-        var y = (h >> 1) - v * (h >> 1);
-        if (x === 0) wctx.moveTo(x, y); else wctx.lineTo(x, y);
+        var phase = twoPi * (x / denom);
+        var v = 0;
+        for (var i = 0; i < bank.length; i++) {
+          var cell = bank[i];
+          var a = cell && cell.amp ? cell.amp : 0;
+          if (a > 0) v += a * Math.sin((i + 1) * phase);
+        }
+        vals[x] = v;
+        var av = v < 0 ? -v : v;
+        if (av > peak) peak = av;
+      }
+
+      wctx.beginPath();
+      if (peak <= 1e-12) {
+        var mid = h >> 1;
+        wctx.moveTo(0, mid);
+        wctx.lineTo(w, mid);
+      } else {
+        var gain = 0.95 / peak;
+        for (var x2 = 0; x2 < w; x2++) {
+          var vv = vals[x2] * gain;
+          if (vv > 1) vv = 1; else if (vv < -1) vv = -1;
+          var y = (h >> 1) - vv * (h >> 1);
+          if (x2 === 0) wctx.moveTo(x2, y); else wctx.lineTo(x2, y);
+        }
       }
       wctx.stroke();
-    }
-    function frameStats(buf) {
-      var n = buf.length, sum = 0, peak = 0;
-      for (var i = 0; i < n; i++) {
-        var v = buf[i];
-        sum += v;
-        var a = v < 0 ? -v : v;
-        if (a > peak) peak = a;
-      }
-      return { mean: sum / n, peak: peak };
-    }
-
-    function findRisingTrigger(buf, level, hyst, maxLook) {
-      var hi = level + hyst, lo = level - hyst;
-      var armed = true, n = Math.min(buf.length - 1, maxLook | 0);
-      for (var i = 1; i < n; i++) {
-        var p = buf[i - 1], c = buf[i];
-        // Schmitt: arm below 'lo', fire crossing 'hi'
-        if (armed && p < lo && c >= hi) return i;
-        if (c < lo) armed = true;
-      }
-      return 0; // fallback
     }
     /* ============ Synth core ============ */
     var F_MIN = 10, F_MAX = 20000;
@@ -773,6 +742,7 @@
           stateAmp[i] = clamp(bank[i].amp || 0, 0, AMP_MAX);
           stateCoeff[i] = clamp(bank[i].coeff || 0, 0, 1);
         }
+        waveDirty = true;
         return;
       }
       dirty.forEach(function (i) {
@@ -780,6 +750,7 @@
         stateAmp[i] = clamp(bank[i].amp || 0, 0, AMP_MAX);
         stateCoeff[i] = clamp(bank[i].coeff || 0, 0, 1);
       });
+      waveDirty = true;
     }
     function applyStateToVisibleBank() {
       ensureStateLength(bank.length);
@@ -789,6 +760,7 @@
         cell.coeff = clamp(stateCoeff[i], 0, 1);
         if (cell.coeffEl) cell.coeffEl.textContent = 'Coeff: ' + toPct(cell.coeff);
       });
+      waveDirty = true;
     }
     function updateRowAmpUI(i, adjustSliders) {
       var cell = bank[i];
@@ -1246,4 +1218,4 @@
     })();
 
     document.addEventListener('visibilitychange', function () { if (document.hidden) { stopEngine(); } });
-  
+
