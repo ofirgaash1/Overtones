@@ -60,22 +60,6 @@
         ];
       }
     }
-    function renderWave() {
-      var w = waveCanvas.width, h = waveCanvas.height;
-      wctx.clearRect(0, 0, w, h);
-      if (!analyser || !timeArray) return;
-      analyser.getFloatTimeDomainData(timeArray);
-      wctx.lineWidth = Math.max(1, Math.floor(dpr));
-      wctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--ok') || '#2ec27e';
-      wctx.beginPath();
-      var step = timeArray.length / w;
-      for (var x = 0; x < w; x++) {
-        var v = timeArray[(x * step) | 0];
-        var y = (h >> 1) - v * (h >> 1);
-        if (x === 0) wctx.moveTo(x, y); else wctx.lineTo(x, y);
-      }
-      wctx.stroke();
-    }
     function renderSpectrogram() {
   if (!analyser || !freqArray || !rowToBin) return;
   const w = specCanvas.width, h = specCanvas.height;
@@ -268,9 +252,9 @@
     function nyquist() { return (audioCtx ? audioCtx.sampleRate / 2 : 22050); }
     function limitHz() { return Math.min(F_MAX, nyquist()); }
     function maxHarmonicsFor(base) {
-      var lim = limitHz(); var N = 0;
-      for (var n = 1; n < 8192; n++) { if (partialFreq(n, base) <= lim) N = n; else break; }
-      return N;
+      var lim = limitHz();
+      if (!isFinite(base) || base <= 0) return 0;
+      return Math.max(0, Math.min(8191, Math.floor(lim / base)));
     }
 
     var audioCtx = null;
@@ -590,7 +574,7 @@
         setSavedForIndex(pivotIdx, nextAmp);
         bank[pivotIdx].amp = 0;
         if (!silent) {
-          updateAmpUI(hasAdjustSliders ? adjustSliders : true);
+          updateAmpUI(hasAdjustSliders ? adjustSliders : true, rowsInSameGroup(pivotIdx));
           setMasterFromSum();
           syncGroupCheckboxVisual(key);
           if (!updateCurrentWaveInPlace()) refreshWaveDebounced();
@@ -606,7 +590,7 @@
           adjustSliders: hasAdjustSliders ? adjustSliders : true
         });
       } else if (!silent) {
-        updateAmpUI(adjustSliders);
+        updateAmpUI(adjustSliders, rowsInSameGroup(pivotIdx));
         setMasterFromSum();
       }
 
@@ -668,28 +652,53 @@
       finish();
     }
 
-
-    function updateAmpUI(adjustSliders) {
+    function rowsInSameGroup(i) {
+      if (i < 0 || i >= bank.length) return [];
+      var g = groupState.get(groupKeyForIndex(i));
+      if (!g || !Array.isArray(g.indices) || g.indices.length === 0) return [i];
+      return g.indices;
+    }
+    function normalizeDirtyRows(dirtyRows) {
+      if (dirtyRows == null) return null;
+      var list = Array.isArray(dirtyRows) ? dirtyRows : [dirtyRows];
+      var seen = new Set();
+      var out = [];
+      list.forEach(function (i) {
+        var idx = i | 0;
+        if (idx < 0 || idx >= bank.length || seen.has(idx)) return;
+        seen.add(idx);
+        out.push(idx);
+      });
+      return out;
+    }
+    function updateRowAmpUI(i, adjustSliders) {
+      var cell = bank[i];
+      if (!cell) return;
+      var shownAmp = isIndexEnabled(i) ? cell.amp : getUnderlyingAmp(i);
+      cell.ampEl.textContent = 'Amp: ' + toPct(shownAmp);
+      if (adjustSliders && cell.sliderEl) cell.sliderEl.value = shownAmp.toFixed(4);
+      if (cell.muteBtnEl) {
+        var muted = isRowEffectivelyMuted(i);
+        cell.muteBtnEl.textContent = muted ? 'Unmute' : 'Mute';
+        cell.muteBtnEl.classList.toggle('is-unmute', muted);
+        cell.muteBtnEl.setAttribute('aria-pressed', muted ? 'true' : 'false');
+      }
+      if (cell.groupMuteBtnEl) {
+        var groupEnabled = isGroupEnabledByRows(groupKeyForIndex(i));
+        cell.groupMuteBtnEl.textContent = groupToggleButtonText(groupEnabled);
+        cell.groupMuteBtnEl.classList.toggle('is-unmute', !groupEnabled);
+        cell.groupMuteBtnEl.setAttribute('aria-pressed', !groupEnabled ? 'true' : 'false');
+      }
+    }
+    function updateAmpUI(adjustSliders, dirtyRows) {
       adjustSliders = !!adjustSliders;
       var sA = sumAmps();
-      bank.forEach(function (cell, i) {
-        if (!cell) return;
-        var shownAmp = isIndexEnabled(i) ? cell.amp : getUnderlyingAmp(i);
-        cell.ampEl.textContent = 'Amp: ' + toPct(shownAmp);
-        if (adjustSliders && cell.sliderEl) cell.sliderEl.value = shownAmp.toFixed(4);
-        if (cell.muteBtnEl) {
-          var muted = isRowEffectivelyMuted(i);
-          cell.muteBtnEl.textContent = muted ? 'Unmute' : 'Mute';
-          cell.muteBtnEl.classList.toggle('is-unmute', muted);
-          cell.muteBtnEl.setAttribute('aria-pressed', muted ? 'true' : 'false');
-        }
-        if (cell.groupMuteBtnEl) {
-          var groupEnabled = isGroupEnabledByRows(groupKeyForIndex(i));
-          cell.groupMuteBtnEl.textContent = groupToggleButtonText(groupEnabled);
-          cell.groupMuteBtnEl.classList.toggle('is-unmute', !groupEnabled);
-          cell.groupMuteBtnEl.setAttribute('aria-pressed', !groupEnabled ? 'true' : 'false');
-        }
-      });
+      var dirty = normalizeDirtyRows(dirtyRows);
+      if (!dirty) {
+        bank.forEach(function (_, i) { updateRowAmpUI(i, adjustSliders); });
+      } else {
+        dirty.forEach(function (i) { updateRowAmpUI(i, adjustSliders); });
+      }
       var sC = (sumCoeffs() * 100).toFixed(2);
       var label = (presetMode === 'custom' ? (presetBase || 'custom') : presetMode) + (userTouchedAmps ? ' (tweaked)' : '');
       countNote.textContent = 'Partials: ' + bank.length + ' | Sum Coeff = ' + sC + '% | Sum Amp = ' + (sA * 100).toFixed(2) + '% (Master ' + master.value + '%) | Preset=' + label;
