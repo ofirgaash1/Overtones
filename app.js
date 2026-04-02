@@ -625,8 +625,8 @@
       syncCoeffsToAmpsNormalized();
       syncGroupCheckboxVisual(key);
 
-      // Rebuild (debounced) only if needed (e.g., harmonic mode)
-      refreshWaveDebounced();
+      // Avoid audible re-attack by patching running oscillator when possible.
+      if (!updateCurrentWaveInPlace()) refreshWaveDebounced();
     }
 
 
@@ -732,6 +732,23 @@
     }
     function connectEngineToAnalyser(engine) {
       try { if (engine && engine.gain && analyser) engine.gain.connect(analyser); } catch (_) { }
+    }
+    function updateCurrentWaveInPlace() {
+      if (!audioCtx || !currentEngine || currentEngine.type !== 'harmonic') return false;
+      try {
+        var base = Number(freqNum.value);
+        var N = Math.min(bank.length, maxHarmonicsFor(base));
+        var real = new Float32Array(N + 1);
+        var imag = new Float32Array(N + 1);
+        for (var n = 1; n <= N; n++) imag[n] = bank[n - 1] && bank[n - 1].amp ? bank[n - 1].amp : 0;
+        var wave = audioCtx.createPeriodicWave(real, imag, { disableNormalization: true });
+        var osc = currentEngine.nodes && currentEngine.nodes[0];
+        if (!osc || typeof osc.setPeriodicWave !== 'function') return false;
+        osc.setPeriodicWave(wave);
+        return true;
+      } catch (_) {
+        return false;
+      }
     }
     function createHarmonicEngine(base) {
       var N = Math.min(bank.length, maxHarmonicsFor(base));
@@ -994,7 +1011,8 @@
     master.addEventListener('input', function () {
       var targetSum = clamp(parseFloat(master.value) / 100, 0, ABS_CAP);
       scaleToTargetWithCap(targetSum);
-      refreshWaveDebounced();
+      // Master drag should not restart the voice envelope.
+      if (!updateCurrentWaveInPlace()) refreshWaveDebounced();
     });
 
     window.addEventListener('keydown', function (e) {
