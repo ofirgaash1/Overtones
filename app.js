@@ -4,22 +4,47 @@
     var waveCanvas = document.getElementById('wave');
     var sctx = specCanvas.getContext('2d', { willReadFrequently: true });
     var wctx = waveCanvas.getContext('2d');
+    sctx.imageSmoothingEnabled = false;
     var analyser = null, timeArray = null, freqArray = null, visLoopOn = false;
     var TARGET_FFT = 8192*2, MIN_HZ = 20, rowToBin = null;
+    var specColImage = null, specColData = null, specColHeight = 0;
+    var specColCanvas = null, specColCtx = null;
 
-    function resizeCanvasToDisplaySize(canvas) {
+    function resizeCanvasToDisplaySize(canvas, opts) {
+      opts = opts || {};
+      var preserve = !!opts.preserve;
+      var anchorRight = !!opts.anchorRight;
       var cssW = Math.max(1, canvas.clientWidth | 0);
       var cssH = Math.max(1, canvas.clientHeight | 0);
       var needW = Math.max(1, Math.floor(cssW * dpr));
       var needH = Math.max(1, Math.floor(cssH * dpr));
       if (canvas.width !== needW || canvas.height !== needH) {
-        canvas.width = needW; canvas.height = needH; return true;
+        var prevW = canvas.width, prevH = canvas.height;
+        var prevCanvas = null;
+        if (preserve && prevW > 0 && prevH > 0) {
+          prevCanvas = document.createElement('canvas');
+          prevCanvas.width = prevW;
+          prevCanvas.height = prevH;
+          prevCanvas.getContext('2d').drawImage(canvas, 0, 0);
+        }
+        canvas.width = needW;
+        canvas.height = needH;
+        if (prevCanvas) {
+          var ctx = canvas.getContext('2d');
+          var copyW = Math.min(prevW, needW);
+          var copyH = Math.min(prevH, needH);
+          var sx = anchorRight ? (prevW - copyW) : 0;
+          var dx = anchorRight ? (needW - copyW) : 0;
+          ctx.drawImage(prevCanvas, sx, 0, copyW, copyH, dx, 0, copyW, copyH);
+        }
+        return true;
       }
       return false;
     }
     function resizeAll() {
-      var a = resizeCanvasToDisplaySize(specCanvas);
+      var a = resizeCanvasToDisplaySize(specCanvas, { preserve: true, anchorRight: true });
       var b = resizeCanvasToDisplaySize(waveCanvas);
+      if (a) sctx.imageSmoothingEnabled = false;
       if ((a || b) && analyser && audioCtx) {
         rowToBin = buildRowToBin(specCanvas.height, audioCtx.sampleRate, analyser.fftSize, MIN_HZ);
       }
@@ -60,37 +85,53 @@
         ];
       }
     }
+    function ensureSpecColumnBuffer(h) {
+      if (!specColCanvas) {
+        specColCanvas = document.createElement('canvas');
+        specColCtx = specColCanvas.getContext('2d', { willReadFrequently: true });
+      }
+      if (!specColImage || specColHeight !== h) {
+        specColCanvas.width = 1;
+        specColCanvas.height = h;
+        specColImage = specColCtx.createImageData(1, h);
+        specColData = specColImage.data;
+        specColHeight = h;
+      }
+      return specColImage;
+    }
     function renderSpectrogram() {
-  if (!analyser || !freqArray || !rowToBin) return;
-  const w = specCanvas.width, h = specCanvas.height;
+      if (!analyser || !freqArray || !rowToBin) return;
+      var w = specCanvas.width, h = specCanvas.height;
 
-  // scroll left by chosen amount
-  const shift = 10;
-  sctx.globalCompositeOperation = 'copy';
-  sctx.drawImage(specCanvas, shift, 0, w - shift, h, 0, 0, w - shift, h);
-  sctx.globalCompositeOperation = 'source-over';
+      // scroll left by chosen amount
+      var shift = Math.min(10, w);
+      sctx.globalCompositeOperation = 'copy';
+      sctx.drawImage(specCanvas, shift, 0, w - shift, h, 0, 0, w - shift, h);
+      sctx.globalCompositeOperation = 'source-over';
 
-  analyser.getByteFrequencyData(freqArray);
+      analyser.getByteFrequencyData(freqArray);
 
-  const col = sctx.createImageData(1, h);
-  const N = freqArray.length;
+      var col = ensureSpecColumnBuffer(h);
+      var data = specColData;
+      var N = freqArray.length;
 
-  for (let y = 0; y < h; y++) {
-    const c = rowToBin[y] | 0;
-    const band = Math.max(1, (c * 0.02) | 0);
-    const lo = Math.max(0, c - band);
-    const hi = Math.min(N - 1, c + band);
+      for (var y = 0; y < h; y++) {
+        var c = rowToBin[y] | 0;
+        var band = Math.max(1, (c * 0.02) | 0);
+        var lo = Math.max(0, c - band);
+        var hi = Math.min(N - 1, c + band);
 
-    let maxV = 0;
-    for (let k = lo; k <= hi; k++) if (freqArray[k] > maxV) maxV = freqArray[k];
-    const t = maxV / 255;
-    const [r, g, b] = heatColor01(t);
-    const idx = 4 * y;
-    col.data[idx] = r; col.data[idx + 1] = g; col.data[idx + 2] = b; col.data[idx + 3] = 255;
-  }
+        var maxV = 0;
+        for (var k = lo; k <= hi; k++) if (freqArray[k] > maxV) maxV = freqArray[k];
+        var t = maxV / 255;
+        var rgb = heatColor01(t);
+        var idx = 4 * y;
+        data[idx] = rgb[0]; data[idx + 1] = rgb[1]; data[idx + 2] = rgb[2]; data[idx + 3] = 255;
+      }
 
-  for (let x = 0; x < shift; x++) sctx.putImageData(col, w - shift + x, 0);
-}
+      specColCtx.putImageData(col, 0, 0);
+      sctx.drawImage(specColCanvas, w - shift, 0, shift, h);
+    }
     function startVisLoop() {
       if (visLoopOn) return;
       visLoopOn = true;
@@ -277,6 +318,8 @@
     var bank = [];
     var groupState = new Map();
     var rowMuteSaved = new Map();
+    var stateAmp = [];
+    var stateCoeff = [];
     var AMP_EPS = 1e-9;
 
     function sumAmps() { return Array.isArray(bank) ? bank.reduce(function (s, b) { return s + (b && b.amp || 0); }, 0) : 0; }
@@ -321,8 +364,9 @@
     function setSavedForIndex(i, val) { }
     function getUnderlyingAmp(i) { return bank[i] && bank[i].amp ? bank[i].amp : 0; }
     function pruneRowMuteSaved() {
+      var maxLen = Math.max(bank.length, stateAmp.length, stateCoeff.length);
       var keys = Array.from(rowMuteSaved.keys());
-      keys.forEach(function (i) { if (i < 0 || i >= bank.length) rowMuteSaved.delete(i); });
+      keys.forEach(function (i) { if (i < 0 || i >= maxLen) rowMuteSaved.delete(i); });
     }
     function isRowManuallyMuted(i) { return rowMuteSaved.has(i); }
     function isRowForceEnabled(i) { return false; }
@@ -384,17 +428,26 @@
 
     function reapplyGroupMutes() {
       applyRowManualMutes();
+      persistVisibleState();
       updateAmpUI(true); setMasterFromSum(); refreshWaveDebounced();
     }
 
     function updateCoeffUI() {
       bank.forEach(function (c) { if (c && c.coeffEl) c.coeffEl.textContent = 'Coeff: ' + toPct(c.coeff); });
     }
+    function normalizeCoeffsToUnitSum() {
+      var s = sumCoeffs();
+      if (s <= 1e-12) return;
+      bank.forEach(function (c) { if (c) c.coeff = (c.coeff || 0) / s; });
+      updateCoeffUI();
+      persistVisibleState();
+    }
     function syncCoeffsToAmpsNormalized() {
       var s = sumAmps();
       if (s <= 1e-12) return; // nothing to sync
       bank.forEach(function (c) { if (c) c.coeff = (c.amp || 0) / s; });
       updateCoeffUI();
+      persistVisibleState();
     }
 
     function allocateByCoeffs(target, opts) {
@@ -441,6 +494,7 @@
 
       updateAmpUI(true);
       setMasterFromSum();
+      persistVisibleState();
 
     }
 
@@ -463,6 +517,7 @@
 
       updateAmpUI(true);
       setMasterFromSum();
+      persistVisibleState();
 
     }
 
@@ -472,6 +527,42 @@
       if (presetBase === 'saw') return 1 / n;
       if (presetBase === 'square') return (n % 2 === 1) ? 1 / n : 0;
       return 0; // fallback for true custom with no baseline
+    }
+    function presetCoeffFor(kind, i) {
+      var n = i + 1;
+      if (kind === 'saw') return 1 / n;
+      if (kind === 'square') return (n % 2 === 1) ? 1 / n : 0;
+      return coeffDefaultForIndex(i);
+    }
+    function ensureStateLength(N) {
+      for (var i = 0; i < N; i++) {
+        if (typeof stateCoeff[i] !== 'number') stateCoeff[i] = presetCoeffFor(presetMode, i);
+        if (typeof stateAmp[i] !== 'number') stateAmp[i] = 0;
+      }
+    }
+    function buildCarryFromState(N) {
+      ensureStateLength(N);
+      var coeffs = new Array(N);
+      var amps = new Array(N);
+      for (var i = 0; i < N; i++) {
+        coeffs[i] = stateCoeff[i];
+        amps[i] = stateAmp[i];
+      }
+      return { coeffs: coeffs, amps: amps };
+    }
+    function applyPresetStateForVisible(kind, N, target) {
+      if (N <= 0) return;
+      var coeffs = new Array(N);
+      for (var i = 0; i < N; i++) coeffs[i] = presetCoeffFor(kind, i);
+      var sc = coeffs.reduce(function (s, c) { return s + c; }, 0);
+      if (sc > 1e-12) {
+        for (var k = 0; k < N; k++) coeffs[k] = coeffs[k] / sc;
+      }
+      var amps = _allocByCoeffsPure(coeffs, clamp(target, 0, ABS_CAP), AMP_MAX);
+      for (var j = 0; j < N; j++) {
+        stateCoeff[j] = coeffs[j];
+        stateAmp[j] = amps[j];
+      }
     }
 
     function buildBankUI(base, carry, opts) {
@@ -573,6 +664,7 @@
         // Editing a muted partial should change its stored value and keep audible amp muted.
         setSavedForIndex(pivotIdx, nextAmp);
         bank[pivotIdx].amp = 0;
+        persistVisibleState([pivotIdx]);
         if (!silent) {
           updateAmpUI(hasAdjustSliders ? adjustSliders : true, rowsInSameGroup(pivotIdx));
           setMasterFromSum();
@@ -596,6 +688,7 @@
 
       // Keep coeffs in sync with user intent
       if (!skipCoeffSync) syncCoeffsToAmpsNormalized();
+      else persistVisibleState(rowsInSameGroup(pivotIdx));
       if (!silent) {
         syncGroupCheckboxVisual(key);
         // Avoid audible re-attack by patching running oscillator when possible.
@@ -609,6 +702,7 @@
       var skipUi = !!opts.skipUi;
       var adjustSliders = (typeof opts.adjustSliders === 'boolean') ? opts.adjustSliders : true;
       function finish() {
+        persistVisibleState();
         if (skipUi) return;
         updateAmpUI(adjustSliders);
         setMasterFromSum();
@@ -671,6 +765,31 @@
       });
       return out;
     }
+    function persistVisibleState(dirtyRows) {
+      var dirty = normalizeDirtyRows(dirtyRows);
+      if (!dirty) {
+        for (var i = 0; i < bank.length; i++) {
+          if (!bank[i]) continue;
+          stateAmp[i] = clamp(bank[i].amp || 0, 0, AMP_MAX);
+          stateCoeff[i] = clamp(bank[i].coeff || 0, 0, 1);
+        }
+        return;
+      }
+      dirty.forEach(function (i) {
+        if (!bank[i]) return;
+        stateAmp[i] = clamp(bank[i].amp || 0, 0, AMP_MAX);
+        stateCoeff[i] = clamp(bank[i].coeff || 0, 0, 1);
+      });
+    }
+    function applyStateToVisibleBank() {
+      ensureStateLength(bank.length);
+      bank.forEach(function (cell, i) {
+        if (!cell) return;
+        cell.amp = clamp(stateAmp[i], 0, AMP_MAX);
+        cell.coeff = clamp(stateCoeff[i], 0, 1);
+        if (cell.coeffEl) cell.coeffEl.textContent = 'Coeff: ' + toPct(cell.coeff);
+      });
+    }
     function updateRowAmpUI(i, adjustSliders) {
       var cell = bank[i];
       if (!cell) return;
@@ -709,11 +828,13 @@
       rowMuteSaved.clear();
       if (kind === 'saw') {
         presetMode = 'saw'; presetBase = 'saw'; userTouchedAmps = false;
-        bank.forEach(function (cell, i) { var c = 1 / (i + 1); cell.coeff = c; if (cell.coeffEl) cell.coeffEl.textContent = 'Coeff: ' + toPct(c); });
+        bank.forEach(function (cell, i) { cell.coeff = 1 / (i + 1); });
+        normalizeCoeffsToUnitSum();
         allocateByCoeffs(ABS_CAP);
       } else if (kind === 'square') {
         presetMode = 'square'; presetBase = 'square'; userTouchedAmps = false;
-        bank.forEach(function (cell, i) { var n = i + 1; var c = (n % 2 === 1) ? 1 / n : 0; cell.coeff = c; if (cell.coeffEl) cell.coeffEl.textContent = 'Coeff: ' + toPct(c); });
+        bank.forEach(function (cell, i) { var n = i + 1; cell.coeff = (n % 2 === 1) ? 1 / n : 0; });
+        normalizeCoeffsToUnitSum();
         allocateByCoeffs(ABS_CAP);
       }
       reapplyGroupMutes();
@@ -812,40 +933,29 @@
 
     function onBaseChange() {
       var base = Number(freqNum.value);
-      var prevSumAudible = sumAmps();
-      var prevMaxN = lastMaxN;
-
-      var carry = {
-        coeffs: bank.map(function (b) { return b && typeof b.coeff === 'number' ? b.coeff : undefined; }),
-        amps: bank.map(function (b, i) { return getUnderlyingAmp(i); })
-      };
-
-      updateBankTitlesOnly(base);
       var neededMaxN = maxHarmonicsFor(base);
+      persistVisibleState();
+      ensureStateLength(neededMaxN);
 
-      if (neededMaxN !== prevMaxN) {
+      // Untweaked presets should keep their ideal profile as harmonic count changes.
+      if (presetMode !== 'custom' && !userTouchedAmps) {
+        var target = clamp(parseFloat(master.value) / 100, 0, ABS_CAP);
+        applyPresetStateForVisible(presetMode, neededMaxN, target);
+      }
+
+      if (neededMaxN !== lastMaxN) {
+        var carry = buildCarryFromState(neededMaxN);
         buildBankUI(base, carry, { skipFit: true });
       } else {
-        bank.forEach(function (cell, i) {
-          if (cell) cell.amp = clamp(carry.amps[i] != null ? carry.amps[i] : cell.amp, 0, AMP_MAX);
-        });
+        updateBankTitlesOnly(base);
+        applyStateToVisibleBank();
       }
 
-      var target = Math.min(prevSumAudible, ABS_CAP);
-      var countChanged = (neededMaxN !== prevMaxN);
-
-      // IMPORTANT: when re-allocating due to harmonic-count or preset-controlled case,
-      // allocate only over ENABLED partials to avoid losing audible sum into muted groups.
-      if (countChanged) {
-        allocateByCoeffs(target, { enabledOnly: true });
-      } else if (presetMode !== 'custom' && !userTouchedAmps) {
-        allocateByCoeffs(target, { enabledOnly: true });
-      } else {
-        // Custom+tweaked case: proportional scaling preserves audible sum even with mutes.
-        scaleToTargetWithCap(target);
-      }
-
-      reapplyGroupMutes();
+      applyRowManualMutes();
+      if (sumAmps() > ABS_CAP + 1e-12) enforceCap(-1, ABS_CAP, { skipUi: true, adjustSliders: true });
+      updateAmpUI(true);
+      setMasterFromSum();
+      persistVisibleState();
 
       if (currentEngine) {
         try {
