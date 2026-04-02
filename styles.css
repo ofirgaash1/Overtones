@@ -47,10 +47,26 @@
       padding: 24px;
     }
 
+    .card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+
     h1 {
-      margin: 0 0 8px;
+      margin: 0;
       font-size: 1.6rem;
       letter-spacing: .2px;
+    }
+
+    .donate-form {
+      margin: 0;
+      margin-left: auto;
+      flex: 0 0 auto;
+      line-height: 0;
     }
 
     .controls {
