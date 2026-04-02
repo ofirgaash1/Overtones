@@ -290,6 +290,26 @@
     var stateAmp = [];
     var stateCoeff = [];
     var AMP_EPS = 1e-9;
+    var hintToastEl = null;
+    var hintToastTimer = null;
+
+    function ensureHintToast() {
+      if (hintToastEl) return hintToastEl;
+      hintToastEl = document.createElement('div');
+      hintToastEl.id = 'hintToast';
+      hintToastEl.className = 'hint-toast';
+      hintToastEl.setAttribute('role', 'status');
+      hintToastEl.setAttribute('aria-live', 'polite');
+      document.body.appendChild(hintToastEl);
+      return hintToastEl;
+    }
+    function showHintToast(msg) {
+      var el = ensureHintToast();
+      el.textContent = msg;
+      el.classList.add('show');
+      if (hintToastTimer) clearTimeout(hintToastTimer);
+      hintToastTimer = setTimeout(function () { el.classList.remove('show'); }, 2600);
+    }
 
     function sumAmps() { return Array.isArray(bank) ? bank.reduce(function (s, b) { return s + (b && b.amp || 0); }, 0) : 0; }
     function sumCoeffs() { return Array.isArray(bank) ? bank.reduce(function (s, b) { return s + (b && b.coeff || 0); }, 0) : 0; }
@@ -338,8 +358,9 @@
       keys.forEach(function (i) { if (i < 0 || i >= maxLen) rowMuteSaved.delete(i); });
     }
     function isRowManuallyMuted(i) { return rowMuteSaved.has(i); }
+    function isRowSilentByAmp(i) { return getUnderlyingAmp(i) <= AMP_EPS; }
     function isRowForceEnabled(i) { return false; }
-    function isRowEffectivelyMuted(i) { return isRowManuallyMuted(i); }
+    function isRowEffectivelyMuted(i) { return isRowManuallyMuted(i) || isRowSilentByAmp(i); }
     function applyRowManualMutes() {
       rowMuteSaved.forEach(function (_, i) {
         if (!bank[i]) return;
@@ -356,39 +377,50 @@
       if (isRowManuallyMuted(i)) {
         var restore = clamp(rowMuteSaved.get(i), 0, AMP_MAX);
         rowMuteSaved.delete(i);
+        if (restore <= AMP_EPS && !silent) {
+          onAmpChange(i, 0, { silent: silent, adjustSliders: true, skipCoeffSync: skipCoeffSync });
+          showHintToast('n=' + (i + 1) + ' is at 0% amp. Raise its slider above 0% to unmute.');
+          return;
+        }
         onAmpChange(i, restore, { silent: silent, adjustSliders: true, skipCoeffSync: skipCoeffSync });
       } else {
-        rowMuteSaved.set(i, clamp(bank[i].amp || 0, 0, AMP_MAX));
+        var curAmp = clamp(bank[i].amp || 0, 0, AMP_MAX);
+        if (curAmp <= AMP_EPS) {
+          if (!silent) {
+            updateAmpUI(true, rowsInSameGroup(i));
+            setMasterFromSum();
+            syncGroupCheckboxVisual(groupKeyForIndex(i));
+            showHintToast('n=' + (i + 1) + ' is at 0% amp. Raise its slider above 0% to unmute.');
+          }
+          return;
+        }
+        rowMuteSaved.set(i, curAmp);
         onAmpChange(i, 0, { silent: silent, adjustSliders: true, skipCoeffSync: skipCoeffSync });
       }
     }
     function groupManualMutedCount(g) {
       if (!g || !Array.isArray(g.indices) || g.indices.length === 0) return 0;
-      return g.indices.reduce(function (n, i) { return n + (isRowManuallyMuted(i) ? 1 : 0); }, 0);
+      return g.indices.reduce(function (n, i) { return n + (isRowEffectivelyMuted(i) ? 1 : 0); }, 0);
     }
     function isGroupEnabledByRows(key) {
       var g = groupState.get(key);
       if (!g || !Array.isArray(g.indices) || g.indices.length === 0) return true;
-      return !g.indices.every(function (i) { return isRowManuallyMuted(i); });
+      return !g.indices.every(function (i) { return isRowEffectivelyMuted(i); });
     }
     function groupForcedEnabledCount(g) {
       return 0;
     }
     function isGroupPartiallyMuted(g) {
       if (!g || !Array.isArray(g.indices) || g.indices.length === 0) return false;
-      if (g.enabled) {
-        var muted = groupManualMutedCount(g);
-        return muted > 0 && muted < g.indices.length;
-      }
-      var unmuted = groupForcedEnabledCount(g);
-      return unmuted > 0 && unmuted < g.indices.length;
+      var muted = groupManualMutedCount(g);
+      return muted > 0 && muted < g.indices.length;
     }
     function syncGroupCheckboxVisual(key) {
       var g = groupState.get(key);
       if (!g || !groupsEl) return;
       var cb = groupsEl.querySelector('input[type="checkbox"][data-group-key="' + key + '"]');
       if (!cb) return;
-      cb.checked = !!g.enabled;
+      cb.checked = isGroupEnabledByRows(key);
       cb.indeterminate = isGroupPartiallyMuted(g);
     }
     function syncAllGroupCheckboxVisuals() {
@@ -568,7 +600,7 @@
         // NEW: default amp for brand new partials is 0 (not 0.3), we'll redistribute explicitly
         var ampInit = (typeof carry.amps[i] === 'number') ? clamp(carry.amps[i], 0, AMP_MAX) : 0;
         slider.value = ampInit.toFixed(4);
-        var ampEl = document.createElement('div'); ampEl.className = 'out'; ampEl.textContent = 'Amp: ' + toPct(ampInit);
+        var ampEl = document.createElement('div'); ampEl.className = 'out'; ampEl.textContent = 'Amp: ' + (ampInit <= AMP_EPS ? 'mute' : toPct(ampInit));
 
         // Coeff init: prefer carry; else baseline preset shape even in custom; else 0
         var coeffInit = (typeof carry.coeffs[i] === 'number') ? clamp(carry.coeffs[i], 0, 1)
@@ -766,13 +798,20 @@
       var cell = bank[i];
       if (!cell) return;
       var shownAmp = isIndexEnabled(i) ? cell.amp : getUnderlyingAmp(i);
-      cell.ampEl.textContent = 'Amp: ' + toPct(shownAmp);
+      cell.ampEl.textContent = 'Amp: ' + (shownAmp <= AMP_EPS ? 'mute' : toPct(shownAmp));
       if (adjustSliders && cell.sliderEl) cell.sliderEl.value = shownAmp.toFixed(4);
       if (cell.muteBtnEl) {
+        var manuallyMuted = isRowManuallyMuted(i);
+        var silentByAmp = isRowSilentByAmp(i);
         var muted = isRowEffectivelyMuted(i);
         cell.muteBtnEl.textContent = muted ? 'Unmute' : 'Mute';
         cell.muteBtnEl.classList.toggle('is-unmute', muted);
         cell.muteBtnEl.setAttribute('aria-pressed', muted ? 'true' : 'false');
+        if (muted && !manuallyMuted && silentByAmp) {
+          cell.muteBtnEl.title = 'Amp is 0%. Raise the slider above 0% to unmute this partial.';
+        } else {
+          cell.muteBtnEl.title = '';
+        }
       }
       if (cell.groupMuteBtnEl) {
         var groupEnabled = isGroupEnabledByRows(groupKeyForIndex(i));
@@ -994,7 +1033,7 @@
         var freqs = [];
         for (var n = p; n <= N; n *= 2) { var f = Math.round(partialFreq(n, Number(freqNum.value))); freqs.push(f); }
         var wrap = document.createElement('label'); wrap.className = 'group'; wrap.title = 'n=' + p + '*2^k';
-        var cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = g.enabled; cb.addEventListener('change', function () { onGroupToggle(key, cb.checked); });
+        var cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = isGroupEnabledByRows(key); cb.addEventListener('change', function () { onGroupToggle(key, cb.checked); });
         cb.setAttribute('data-group-key', key);
         cb.indeterminate = isGroupPartiallyMuted(g);
         var txt = document.createElement('span');
@@ -1004,9 +1043,12 @@
       });
     }
 
+    function anyGroupEnabledByRows() {
+      return Array.from(groupState.keys()).some(function (key) { return isGroupEnabledByRows(key); });
+    }
     function updateGroupsToggleAllLabel() {
       if (!groupsToggleAllBtn) return;
-      var anyEnabled = Array.from(groupState.values()).some(function (g) { return g.enabled; });
+      var anyEnabled = anyGroupEnabledByRows();
       groupsToggleAllBtn.textContent = anyEnabled ? 'Untick all' : 'Tick all';
     }
 
@@ -1025,6 +1067,9 @@
       syncCoeffsToAmpsNormalized();
       if (sumAmps() > ABS_CAP + 1e-12) enforceCap(-1, ABS_CAP, { skipUi: true, adjustSliders: true });
       updateAmpUI(true); setMasterFromSum();
+      if (enabled && !isGroupEnabledByRows(key)) {
+        showHintToast('All octaves for n=' + g.p + ' are at 0% amp. Raise at least one slider above 0% to unmute.');
+      }
       if (!updateCurrentWaveInPlace()) refreshWaveDebounced();
       updateGroupsToggleAllLabel();
     }
@@ -1051,6 +1096,9 @@
       if (sumAmps() > ABS_CAP + 1e-12) enforceCap(-1, ABS_CAP, { skipUi: true, adjustSliders: true });
       updateAmpUI(true);
       setMasterFromSum();
+      if (enabled && !anyRowAudible()) {
+        showHintToast('All partials are at 0% amp. Raise one or more sliders above 0% to unmute.');
+      }
       if (!updateCurrentWaveInPlace()) refreshWaveDebounced();
       renderGroups(Number(freqNum.value));
       updateGroupsToggleAllLabel();
@@ -1067,7 +1115,7 @@
     presetSquareBtn.addEventListener('click', function () { applyPreset('square'); });
     if (groupsToggleAllBtn) {
       groupsToggleAllBtn.addEventListener('click', function () {
-        var anyEnabled = Array.from(groupState.values()).some(function (g) { return g.enabled; });
+        var anyEnabled = anyGroupEnabledByRows();
         setAllGroups(!anyEnabled);
       });
     }
@@ -1208,8 +1256,15 @@
     }
 
     (function init() {
-      document.getElementById('freqSlider').value = hzToLin(Number(freqNum.value)).toFixed(4);
-      buildBankUI(Number(freqNum.value));
+      var base = Number(freqNum.value);
+      var initialTarget = clamp(parseFloat(master.value) / 100, 0, ABS_CAP);
+      var initialN = maxHarmonicsFor(base);
+      presetMode = 'saw';
+      presetBase = 'saw';
+      userTouchedAmps = false;
+      applyPresetStateForVisible('saw', initialN, initialTarget);
+      document.getElementById('freqSlider').value = hzToLin(base).toFixed(4);
+      buildBankUI(base, buildCarryFromState(initialN));
       setMasterFromSum();
       runTests();
       updateButtons();

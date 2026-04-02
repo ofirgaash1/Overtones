@@ -363,4 +363,27 @@
       cursor: ns-resize !important;
       user-select: none !important
     }
+
+    .hint-toast {
+      position: fixed;
+      left: 50%;
+      bottom: 24px;
+      transform: translate(-50%, 10px);
+      max-width: min(90vw, 720px);
+      padding: 10px 14px;
+      border-radius: 10px;
+      background: rgba(10, 16, 28, .92);
+      border: 1px solid rgba(255, 255, 255, .22);
+      color: #f1f5ff;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, .4);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .16s ease, transform .16s ease;
+      z-index: 1200;
+      font-size: .92rem;
+    }
+    .hint-toast.show {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
   
