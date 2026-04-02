@@ -261,9 +261,8 @@
       var hz = partialFreq(n, base);
       return String(n) + ' | ' + String(Math.round(hz)) + ' Hz | ' + nearestNoteLabelFromHz(hz);
     }
-    function groupToggleButtonTextForIndex(i, base, enabled) {
-      var hz = partialFreq(i + 1, base);
-      return (enabled ? 'Mute all ' : 'Unmute all ') + nearestNoteNameFromHz(hz);
+    function groupToggleButtonText(enabled) {
+      return enabled ? 'Mute all octaves' : 'Unmute all octaves';
     }
     function crossfadeDurationSec(f0) { var t = 6 / clamp(f0, F_MIN, F_MAX); return xfClamp(0.02, 0.08, t); }
     function nyquist() { return (audioCtx ? audioCtx.sampleRate / 2 : 22050); }
@@ -284,6 +283,7 @@
 
     var freqNum = $('#freqNum'), freqSlider = $('#freqSlider');
     var master = $('#master'), masterOut = $('#masterOut');
+    var masterMuteAllBtn = $('#masterMuteAll');
     var toggleBtn = $('#togglePlay');
     var bankEl = $('#bank'), countNote = $('#countNote');
     var presetSawBtn = $('#presetSaw'), presetSquareBtn = $('#presetSquare');
@@ -293,15 +293,23 @@
     var bank = [];
     var groupState = new Map();
     var rowMuteSaved = new Map();
-    var rowForceEnabled = new Set();
     var AMP_EPS = 1e-9;
 
     function sumAmps() { return Array.isArray(bank) ? bank.reduce(function (s, b) { return s + (b && b.amp || 0); }, 0) : 0; }
     function sumCoeffs() { return Array.isArray(bank) ? bank.reduce(function (s, b) { return s + (b && b.coeff || 0); }, 0) : 0; }
+    function anyRowAudible() { return bank.some(function (_, i) { return !isRowEffectivelyMuted(i); }); }
+    function updateMasterMuteAllButtonLabel() {
+      if (!masterMuteAllBtn) return;
+      var anyAudible = anyRowAudible();
+      masterMuteAllBtn.textContent = anyAudible ? 'Mute all' : 'Unmute all';
+      masterMuteAllBtn.classList.toggle('secondary', !anyAudible);
+      masterMuteAllBtn.classList.toggle('success', anyAudible);
+    }
     function setMasterFromSum() {
       var s = sumAmps(); if (!isFinite(s)) return;
       master.value = (s * 100).toFixed(2);
-      masterOut.textContent = (s * 100).toFixed(2) + '% (Sum Amp)';
+      if (masterOut) masterOut.textContent = (s * 100).toFixed(2) + '%';
+      updateMasterMuteAllButtonLabel();
     }
 
     function refreshWaveDebounced() {
@@ -309,8 +317,8 @@
       rebuildTimer = setTimeout(function () {
         rebuildTimer = null;
         if (!currentEngine || !audioCtx) return;
-
-        crossfadeToNewEngine();
+        // Prefer in-place wave replacement to avoid re-creating oscillator/gain graph.
+        if (!updateCurrentWaveInPlace()) crossfadeToNewEngine();
       }, 50); // a bit more debounce to reduce churn
     }
 
@@ -324,63 +332,50 @@
         l: 50 + (p % 2) * 6
       };
     }
-    function isIndexEnabled(i) { var g = groupState.get(groupKeyForIndex(i)); return !g || g.enabled || rowForceEnabled.has(i); }
-    function getSavedForIndex(i) { var g = groupState.get(groupKeyForIndex(i)); if (!g) return undefined; return g.saved.get(i); }
-    function setSavedForIndex(i, val) { var g = groupState.get(groupKeyForIndex(i)); if (!g) return; g.saved.set(i, val); }
-    function getUnderlyingAmp(i) {
-      var enabled = isIndexEnabled(i);
-      if (enabled) return bank[i] && bank[i].amp ? bank[i].amp : 0;
-      var sv = getSavedForIndex(i);
-      return (typeof sv === 'number') ? sv : (bank[i] && bank[i].amp ? bank[i].amp : 0);
-    }
+    function isIndexEnabled(i) { return !isRowManuallyMuted(i); }
+    function getSavedForIndex(i) { return undefined; }
+    function setSavedForIndex(i, val) { }
+    function getUnderlyingAmp(i) { return bank[i] && bank[i].amp ? bank[i].amp : 0; }
     function pruneRowMuteSaved() {
       var keys = Array.from(rowMuteSaved.keys());
       keys.forEach(function (i) { if (i < 0 || i >= bank.length) rowMuteSaved.delete(i); });
     }
-    function pruneRowForceEnabled() {
-      var keys = Array.from(rowForceEnabled.values());
-      keys.forEach(function (i) { if (i < 0 || i >= bank.length) rowForceEnabled.delete(i); });
-    }
     function isRowManuallyMuted(i) { return rowMuteSaved.has(i); }
-    function isRowForceEnabled(i) { return rowForceEnabled.has(i); }
-    function isRowEffectivelyMuted(i) { return !isIndexEnabled(i) || isRowManuallyMuted(i); }
+    function isRowForceEnabled(i) { return false; }
+    function isRowEffectivelyMuted(i) { return isRowManuallyMuted(i); }
     function applyRowManualMutes() {
       rowMuteSaved.forEach(function (_, i) {
         if (!bank[i]) return;
-        if (isIndexEnabled(i)) bank[i].amp = 0;
+        bank[i].amp = 0;
       });
     }
-    function toggleRowMute(i) {
+    function toggleRowMute(i, opts) {
+      opts = opts || {};
+      var silent = !!opts.silent;
+      var skipCoeffSync = !!opts.skipCoeffSync;
       if (i < 0 || i >= bank.length || !bank[i]) return;
       if (presetMode !== 'custom') presetMode = 'custom';
       userTouchedAmps = true;
-      var key = groupKeyForIndex(i);
-      var g = groupState.get(key);
-      var groupEnabled = !g || g.enabled;
-      var currentlyMuted = isRowEffectivelyMuted(i);
-
-      if (currentlyMuted) {
-        var restore = isRowManuallyMuted(i)
-          ? clamp(rowMuteSaved.get(i), 0, AMP_MAX)
-          : clamp(getUnderlyingAmp(i), 0, AMP_MAX);
+      if (isRowManuallyMuted(i)) {
+        var restore = clamp(rowMuteSaved.get(i), 0, AMP_MAX);
         rowMuteSaved.delete(i);
-        if (!groupEnabled) rowForceEnabled.add(i);
-        onAmpChange(i, restore);
+        onAmpChange(i, restore, { silent: silent, adjustSliders: true, skipCoeffSync: skipCoeffSync });
       } else {
-        rowMuteSaved.set(i, clamp(getUnderlyingAmp(i), 0, AMP_MAX));
-        onAmpChange(i, 0);
-        if (!groupEnabled) rowForceEnabled.delete(i);
+        rowMuteSaved.set(i, clamp(bank[i].amp || 0, 0, AMP_MAX));
+        onAmpChange(i, 0, { silent: silent, adjustSliders: true, skipCoeffSync: skipCoeffSync });
       }
-      syncGroupCheckboxVisual(key);
-      updateAmpUI(true);
     }
     function groupManualMutedCount(g) {
       if (!g || !Array.isArray(g.indices) || g.indices.length === 0) return 0;
       return g.indices.reduce(function (n, i) { return n + (isRowManuallyMuted(i) ? 1 : 0); }, 0);
     }
+    function isGroupEnabledByRows(key) {
+      var g = groupState.get(key);
+      if (!g || !Array.isArray(g.indices) || g.indices.length === 0) return true;
+      return !g.indices.every(function (i) { return isRowManuallyMuted(i); });
+    }
     function groupForcedEnabledCount(g) {
-      if (!g || !Array.isArray(g.indices) || g.indices.length === 0) return 0;
-      return g.indices.reduce(function (n, i) { return n + (isRowForceEnabled(i) ? 1 : 0); }, 0);
+      return 0;
     }
     function isGroupPartiallyMuted(g) {
       if (!g || !Array.isArray(g.indices) || g.indices.length === 0) return false;
@@ -404,21 +399,7 @@
     }
 
     function reapplyGroupMutes() {
-      groupState.forEach(function (g) {
-        if (!g.enabled) {
-          g.indices.forEach(function (i) {
-            if (!bank[i]) return;
-            if (isRowForceEnabled(i)) {
-              setSavedForIndex(i, bank[i].amp);
-            } else {
-              setSavedForIndex(i, bank[i].amp);
-              bank[i].amp = 0;
-            }
-          });
-        }
-      });
       applyRowManualMutes();
-      syncAllGroupCheckboxVisuals();
       updateAmpUI(true); setMasterFromSum(); refreshWaveDebounced();
     }
 
@@ -442,7 +423,7 @@
       var idxs = [];
       for (var i = 0; i < bank.length; i++) {
         if (!bank[i]) continue;
-        if (enabledOnly ? isIndexEnabled(i) : true) idxs.push(i);
+        if (enabledOnly ? !isRowManuallyMuted(i) : true) idxs.push(i);
       }
       if (idxs.length === 0) { updateAmpUI(true); setMasterFromSum(); return; }
 
@@ -525,17 +506,14 @@
         muteBtn.textContent = isRowEffectivelyMuted(i) ? 'Unmute' : 'Mute';
         muteBtn.addEventListener('click', function () { toggleRowMute(i); });
         var key = groupKeyForIndex(i);
-        var gNow = groupState.get(key);
-        var groupEnabledNow = !gNow || gNow.enabled;
+        var groupEnabledNow = isGroupEnabledByRows(key);
         var groupMuteBtn = document.createElement('button'); groupMuteBtn.type = 'button'; groupMuteBtn.className = 'row-mute';
-        groupMuteBtn.textContent = groupToggleButtonTextForIndex(i, base, groupEnabledNow);
+        groupMuteBtn.textContent = groupToggleButtonText(groupEnabledNow);
         groupMuteBtn.classList.toggle('is-unmute', !groupEnabledNow);
         groupMuteBtn.title = 'Toggle this row group';
         groupMuteBtn.addEventListener('click', function () {
           var key2 = groupKeyForIndex(i);
-          var g2 = groupState.get(key2);
-          var enabled = !g2 || g2.enabled;
-          onGroupToggle(key2, !enabled);
+          onGroupToggle(key2, !isGroupEnabledByRows(key2));
         });
         var head = document.createElement('div'); head.className = 'bank-head';
         head.appendChild(title);
@@ -572,7 +550,6 @@
         };
       });
       pruneRowMuteSaved();
-      pruneRowForceEnabled();
       lastMaxN = N;
       rebuildGroups(base);
       if (!opts.skipFit) {
@@ -588,16 +565,20 @@
         var n = i + 1;
         cell.titleEl.textContent = partialTitleText(n, base);
         if (cell.groupMuteBtnEl) {
-          var g = groupState.get(groupKeyForIndex(i));
-          var groupEnabled = !g || g.enabled;
-          cell.groupMuteBtnEl.textContent = groupToggleButtonTextForIndex(i, base, groupEnabled);
+          var groupEnabled = isGroupEnabledByRows(groupKeyForIndex(i));
+          cell.groupMuteBtnEl.textContent = groupToggleButtonText(groupEnabled);
           cell.groupMuteBtnEl.classList.toggle('is-unmute', !groupEnabled);
         }
       });
       renderGroups(base);
     }
 
-    function onAmpChange(pivotIdx, newAmp) {
+    function onAmpChange(pivotIdx, newAmp, opts) {
+      opts = opts || {};
+      var silent = !!opts.silent;
+      var skipCoeffSync = !!opts.skipCoeffSync;
+      var hasAdjustSliders = Object.prototype.hasOwnProperty.call(opts, 'adjustSliders');
+      var adjustSliders = hasAdjustSliders ? !!opts.adjustSliders : false;
       if (!Array.isArray(bank) || bank.length === 0) return;
       if (pivotIdx < 0 || pivotIdx >= bank.length || !bank[pivotIdx]) return;
       var nextAmp = clamp(newAmp, 0, AMP_MAX);
@@ -608,35 +589,52 @@
         // Editing a muted partial should change its stored value and keep audible amp muted.
         setSavedForIndex(pivotIdx, nextAmp);
         bank[pivotIdx].amp = 0;
-        updateAmpUI(true);
-        setMasterFromSum();
-        syncGroupCheckboxVisual(key);
-        refreshWaveDebounced();
+        if (!silent) {
+          updateAmpUI(hasAdjustSliders ? adjustSliders : true);
+          setMasterFromSum();
+          syncGroupCheckboxVisual(key);
+          if (!updateCurrentWaveInPlace()) refreshWaveDebounced();
+        }
         return;
       }
 
       bank[pivotIdx].amp = nextAmp;
-      if (isRowForceEnabled(pivotIdx)) setSavedForIndex(pivotIdx, bank[pivotIdx].amp);
       var s = sumAmps();
-      if (s > ABS_CAP + 1e-12) { enforceCap(pivotIdx, ABS_CAP); }
-      else { updateAmpUI(); setMasterFromSum(); }
+      if (s > ABS_CAP + 1e-12) {
+        enforceCap(pivotIdx, ABS_CAP, {
+          skipUi: silent,
+          adjustSliders: hasAdjustSliders ? adjustSliders : true
+        });
+      } else if (!silent) {
+        updateAmpUI(adjustSliders);
+        setMasterFromSum();
+      }
 
       // Keep coeffs in sync with user intent
-      syncCoeffsToAmpsNormalized();
-      syncGroupCheckboxVisual(key);
-
-      // Avoid audible re-attack by patching running oscillator when possible.
-      if (!updateCurrentWaveInPlace()) refreshWaveDebounced();
+      if (!skipCoeffSync) syncCoeffsToAmpsNormalized();
+      if (!silent) {
+        syncGroupCheckboxVisual(key);
+        // Avoid audible re-attack by patching running oscillator when possible.
+        if (!updateCurrentWaveInPlace()) refreshWaveDebounced();
+      }
     }
 
 
-    function enforceCap(pivotIdx, targetSum) {
+    function enforceCap(pivotIdx, targetSum, opts) {
+      opts = opts || {};
+      var skipUi = !!opts.skipUi;
+      var adjustSliders = (typeof opts.adjustSliders === 'boolean') ? opts.adjustSliders : true;
+      function finish() {
+        if (skipUi) return;
+        updateAmpUI(adjustSliders);
+        setMasterFromSum();
+      }
       if (!Array.isArray(bank) || bank.length === 0) { setMasterFromSum(); return; }
       targetSum = clamp(targetSum, 0, ABS_CAP);
       var curSum = sumAmps();
       var eps = 1e-12;
 
-      if (curSum <= targetSum + eps) { updateAmpUI(true); setMasterFromSum(); return; }
+      if (curSum <= targetSum + eps) { finish(); return; }
 
       var N = bank.length;
       var validPivot = (pivotIdx >= 0 && pivotIdx < N && bank[pivotIdx]);
@@ -644,7 +642,7 @@
       if (!validPivot) {
         var scale = targetSum / (curSum || 1);
         bank.forEach(function (c) { if (c) c.amp = clamp(c.amp * scale, 0, AMP_MAX); });
-        updateAmpUI(true); setMasterFromSum();
+        finish();
         return;
       }
 
@@ -652,7 +650,7 @@
       if (pivotAmp >= targetSum) {
         for (var i = 0; i < N; i++) { if (i !== pivotIdx && bank[i]) bank[i].amp = 0; }
         bank[pivotIdx].amp = Math.min(targetSum, AMP_MAX);
-        updateAmpUI(true); setMasterFromSum();
+        finish();
         return;
       }
 
@@ -667,8 +665,7 @@
       var diff = targetSum - after;
       if (Math.abs(diff) > 1e-6) bank[pivotIdx].amp = clamp(bank[pivotIdx].amp + diff, 0, AMP_MAX);
 
-      updateAmpUI(true);
-      setMasterFromSum();
+      finish();
     }
 
 
@@ -687,9 +684,8 @@
           cell.muteBtnEl.setAttribute('aria-pressed', muted ? 'true' : 'false');
         }
         if (cell.groupMuteBtnEl) {
-          var g = groupState.get(groupKeyForIndex(i));
-          var groupEnabled = !g || g.enabled;
-          cell.groupMuteBtnEl.textContent = groupToggleButtonTextForIndex(i, Number(freqNum.value), groupEnabled);
+          var groupEnabled = isGroupEnabledByRows(groupKeyForIndex(i));
+          cell.groupMuteBtnEl.textContent = groupToggleButtonText(groupEnabled);
           cell.groupMuteBtnEl.classList.toggle('is-unmute', !groupEnabled);
           cell.groupMuteBtnEl.setAttribute('aria-pressed', !groupEnabled ? 'true' : 'false');
         }
@@ -702,7 +698,6 @@
     function applyPreset(kind) {
       if (!Array.isArray(bank) || bank.length === 0) { presetMode = kind; presetBase = kind; return; }
       rowMuteSaved.clear();
-      rowForceEnabled.clear();
       if (kind === 'saw') {
         presetMode = 'saw'; presetBase = 'saw'; userTouchedAmps = false;
         bank.forEach(function (cell, i) { var c = 1 / (i + 1); cell.coeff = c; if (cell.coeffEl) cell.coeffEl.textContent = 'Coeff: ' + toPct(c); });
@@ -844,16 +839,13 @@
       reapplyGroupMutes();
 
       if (currentEngine) {
-        if (!countChanged) {
-          try {
-            var osc = currentEngine.nodes[0];
-            var now = audioCtx.currentTime;
-            osc.frequency.cancelScheduledValues(now);
-            osc.frequency.setTargetAtTime(base, now, 0.01);
-          } catch (_) { crossfadeToNewEngine(); }
-        } else {
-          crossfadeToNewEngine();
-        }
+        try {
+          var osc = currentEngine.nodes[0];
+          var now = audioCtx.currentTime;
+          osc.frequency.cancelScheduledValues(now);
+          osc.frequency.setTargetAtTime(base, now, 0.01);
+          if (!updateCurrentWaveInPlace()) crossfadeToNewEngine();
+        } catch (_) { crossfadeToNewEngine(); }
       }
     }
 
@@ -901,6 +893,7 @@
 
 
     function renderGroups(base) {
+      if (!groupsEl) return;
       groupsEl.innerHTML = '';
       var keys = Array.from(groupState.keys()).sort(function (a, b) { return parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10); });
       var N = bank.length;
@@ -921,6 +914,7 @@
     }
 
     function updateGroupsToggleAllLabel() {
+      if (!groupsToggleAllBtn) return;
       var anyEnabled = Array.from(groupState.values()).some(function (g) { return g.enabled; });
       groupsToggleAllBtn.textContent = anyEnabled ? 'Untick all' : 'Tick all';
     }
@@ -929,25 +923,18 @@
       var g = groupState.get(key); if (!g) return; g.enabled = enabled;
       if (!enabled) {
         g.indices.forEach(function (i) {
-          if (!bank[i]) return;
-          var underlying = getUnderlyingAmp(i);
-          g.saved.set(i, underlying);
-          rowForceEnabled.delete(i);
-          bank[i].amp = 0;
+          if (bank[i] && !isRowManuallyMuted(i)) toggleRowMute(i, { silent: true, skipCoeffSync: true });
         });
-        updateAmpUI(true); setMasterFromSum(); refreshWaveDebounced();
       } else {
         g.indices.forEach(function (i) {
-          if (!bank[i]) return;
-          rowForceEnabled.delete(i);
-          var saved = g.saved.get(i);
-          if (typeof saved === 'number') bank[i].amp = clamp(saved, 0, AMP_MAX);
+          if (bank[i] && isRowManuallyMuted(i)) toggleRowMute(i, { silent: true, skipCoeffSync: true });
         });
-        applyRowManualMutes();
-        if (sumAmps() > ABS_CAP + 1e-12) enforceCap(-1, ABS_CAP);
-        updateAmpUI(true); setMasterFromSum(); refreshWaveDebounced();
       }
-      syncGroupCheckboxVisual(key);
+      g.enabled = enabled;
+      syncCoeffsToAmpsNormalized();
+      if (sumAmps() > ABS_CAP + 1e-12) enforceCap(-1, ABS_CAP, { skipUi: true, adjustSliders: true });
+      updateAmpUI(true); setMasterFromSum();
+      if (!updateCurrentWaveInPlace()) refreshWaveDebounced();
       updateGroupsToggleAllLabel();
     }
 
@@ -958,24 +945,22 @@
       if (!enabled) {
         // Act like clicking "Mute" on every row one-by-one.
         bank.forEach(function (_, i) {
-          if (!isRowEffectivelyMuted(i)) toggleRowMute(i);
+          if (!isRowManuallyMuted(i)) toggleRowMute(i, { silent: true, skipCoeffSync: true });
         });
-        rowForceEnabled.clear();
         groupState.forEach(function (g) { g.enabled = false; });
       } else {
         // Act like clicking "Unmute" on every row one-by-one.
         bank.forEach(function (_, i) {
-          if (isRowEffectivelyMuted(i)) toggleRowMute(i);
+          if (isRowManuallyMuted(i)) toggleRowMute(i, { silent: true, skipCoeffSync: true });
         });
         groupState.forEach(function (g) { g.enabled = true; });
-        rowForceEnabled.clear();
-        rowMuteSaved.clear();
       }
 
-      if (sumAmps() > ABS_CAP + 1e-12) enforceCap(-1, ABS_CAP);
+      syncCoeffsToAmpsNormalized();
+      if (sumAmps() > ABS_CAP + 1e-12) enforceCap(-1, ABS_CAP, { skipUi: true, adjustSliders: true });
       updateAmpUI(true);
       setMasterFromSum();
-      refreshWaveDebounced();
+      if (!updateCurrentWaveInPlace()) refreshWaveDebounced();
       renderGroups(Number(freqNum.value));
       updateGroupsToggleAllLabel();
     }
@@ -989,10 +974,17 @@
 
     presetSawBtn.addEventListener('click', function () { applyPreset('saw'); });
     presetSquareBtn.addEventListener('click', function () { applyPreset('square'); });
-    groupsToggleAllBtn.addEventListener('click', function () {
-      var anyEnabled = Array.from(groupState.values()).some(function (g) { return g.enabled; });
-      setAllGroups(!anyEnabled);
-    });
+    if (groupsToggleAllBtn) {
+      groupsToggleAllBtn.addEventListener('click', function () {
+        var anyEnabled = Array.from(groupState.values()).some(function (g) { return g.enabled; });
+        setAllGroups(!anyEnabled);
+      });
+    }
+    if (masterMuteAllBtn) {
+      masterMuteAllBtn.addEventListener('click', function () {
+        setAllGroups(!anyRowAudible());
+      });
+    }
 
     // Frequency: keep integer always (both entry points)
     freqNum.addEventListener('input', function () {

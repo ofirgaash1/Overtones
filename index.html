@@ -27,15 +27,6 @@
         <span class="note" id="countNote"></span>
       </div>
 
-      <details id="groupsPanel">
-        <summary><span class="twisty" aria-hidden="true"></span><strong>Note groups (octaves by odd base)</strong>
-        </summary>
-        <div class="groups-toolbar">
-          <button id="groupsToggleAll" class="success" title="Toggle all note groups">Untick all</button>
-        </div>
-        <div id="groups"></div>
-      </details>
-
       <div class="controls">
         <div class="row">
           <label for="freqSlider">Fundamental (Hz)</label>
@@ -43,9 +34,9 @@
           <input id="freqNum" type="number" min="20" max="20000" step="1" value="80" />
         </div>
         <div class="row">
-          <label for="master">Master (Sum Amp %)</label>
+          <label for="master">Master</label>
           <input id="master" type="range" min="0" max="100" step="0.01" value="40" />
-          <div class="out" id="masterOut">100.00% (Sum Amp)</div>
+          <button id="masterMuteAll" class="success" title="Mute or unmute all partials">Mute all</button>
         </div>
       </div>
 
