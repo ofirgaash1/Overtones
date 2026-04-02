@@ -242,8 +242,29 @@
     var linToLogHz = function (x) { return Math.round(F_MIN * Math.exp(LOG_RANGE * x)); };
     var hzToLin = function (f) { return ln(clamp(f, F_MIN, F_MAX) / F_MIN) / LOG_RANGE; };
     var xfClamp = function (min, max, val) { return Math.max(min, Math.min(max, val)); };
+    var NOTE_NAMES = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B'];
 
     function partialFreq(n, base) { return n * base; }
+    function nearestNoteNameFromHz(hz) {
+      if (!isFinite(hz) || hz <= 0) return '?';
+      var midi = Math.round(69 + 12 * (Math.log(hz / 440) / Math.log(2)));
+      var idx = ((midi % 12) + 12) % 12;
+      return NOTE_NAMES[idx];
+    }
+    function nearestNoteLabelFromHz(hz) {
+      if (!isFinite(hz) || hz <= 0) return '?';
+      var midi = Math.round(69 + 12 * (Math.log(hz / 440) / Math.log(2)));
+      var oct = Math.floor(midi / 12) - 1;
+      return nearestNoteNameFromHz(hz) + String(oct);
+    }
+    function partialTitleText(n, base) {
+      var hz = partialFreq(n, base);
+      return String(n) + ' | ' + String(Math.round(hz)) + ' Hz | ' + nearestNoteLabelFromHz(hz);
+    }
+    function groupToggleButtonTextForIndex(i, base, enabled) {
+      var hz = partialFreq(i + 1, base);
+      return (enabled ? 'Mute all ' : 'Unmute all ') + nearestNoteNameFromHz(hz);
+    }
     function crossfadeDurationSec(f0) { var t = 6 / clamp(f0, F_MIN, F_MAX); return xfClamp(0.02, 0.08, t); }
     function nyquist() { return (audioCtx ? audioCtx.sampleRate / 2 : 22050); }
     function limitHz() { return Math.min(F_MAX, nyquist()); }
@@ -271,6 +292,9 @@
 
     var bank = [];
     var groupState = new Map();
+    var rowMuteSaved = new Map();
+    var rowForceEnabled = new Set();
+    var AMP_EPS = 1e-9;
 
     function sumAmps() { return Array.isArray(bank) ? bank.reduce(function (s, b) { return s + (b && b.amp || 0); }, 0) : 0; }
     function sumCoeffs() { return Array.isArray(bank) ? bank.reduce(function (s, b) { return s + (b && b.coeff || 0); }, 0) : 0; }
@@ -300,7 +324,7 @@
         l: 50 + (p % 2) * 6
       };
     }
-    function isIndexEnabled(i) { var g = groupState.get(groupKeyForIndex(i)); return !g || g.enabled; }
+    function isIndexEnabled(i) { var g = groupState.get(groupKeyForIndex(i)); return !g || g.enabled || rowForceEnabled.has(i); }
     function getSavedForIndex(i) { var g = groupState.get(groupKeyForIndex(i)); if (!g) return undefined; return g.saved.get(i); }
     function setSavedForIndex(i, val) { var g = groupState.get(groupKeyForIndex(i)); if (!g) return; g.saved.set(i, val); }
     function getUnderlyingAmp(i) {
@@ -309,17 +333,92 @@
       var sv = getSavedForIndex(i);
       return (typeof sv === 'number') ? sv : (bank[i] && bank[i].amp ? bank[i].amp : 0);
     }
+    function pruneRowMuteSaved() {
+      var keys = Array.from(rowMuteSaved.keys());
+      keys.forEach(function (i) { if (i < 0 || i >= bank.length) rowMuteSaved.delete(i); });
+    }
+    function pruneRowForceEnabled() {
+      var keys = Array.from(rowForceEnabled.values());
+      keys.forEach(function (i) { if (i < 0 || i >= bank.length) rowForceEnabled.delete(i); });
+    }
+    function isRowManuallyMuted(i) { return rowMuteSaved.has(i); }
+    function isRowForceEnabled(i) { return rowForceEnabled.has(i); }
+    function isRowEffectivelyMuted(i) { return !isIndexEnabled(i) || isRowManuallyMuted(i); }
+    function applyRowManualMutes() {
+      rowMuteSaved.forEach(function (_, i) {
+        if (!bank[i]) return;
+        if (isIndexEnabled(i)) bank[i].amp = 0;
+      });
+    }
+    function toggleRowMute(i) {
+      if (i < 0 || i >= bank.length || !bank[i]) return;
+      if (presetMode !== 'custom') presetMode = 'custom';
+      userTouchedAmps = true;
+      var key = groupKeyForIndex(i);
+      var g = groupState.get(key);
+      var groupEnabled = !g || g.enabled;
+      var currentlyMuted = isRowEffectivelyMuted(i);
+
+      if (currentlyMuted) {
+        var restore = isRowManuallyMuted(i)
+          ? clamp(rowMuteSaved.get(i), 0, AMP_MAX)
+          : clamp(getUnderlyingAmp(i), 0, AMP_MAX);
+        rowMuteSaved.delete(i);
+        if (!groupEnabled) rowForceEnabled.add(i);
+        onAmpChange(i, restore);
+      } else {
+        rowMuteSaved.set(i, clamp(getUnderlyingAmp(i), 0, AMP_MAX));
+        onAmpChange(i, 0);
+        if (!groupEnabled) rowForceEnabled.delete(i);
+      }
+      syncGroupCheckboxVisual(key);
+      updateAmpUI(true);
+    }
+    function groupManualMutedCount(g) {
+      if (!g || !Array.isArray(g.indices) || g.indices.length === 0) return 0;
+      return g.indices.reduce(function (n, i) { return n + (isRowManuallyMuted(i) ? 1 : 0); }, 0);
+    }
+    function groupForcedEnabledCount(g) {
+      if (!g || !Array.isArray(g.indices) || g.indices.length === 0) return 0;
+      return g.indices.reduce(function (n, i) { return n + (isRowForceEnabled(i) ? 1 : 0); }, 0);
+    }
+    function isGroupPartiallyMuted(g) {
+      if (!g || !Array.isArray(g.indices) || g.indices.length === 0) return false;
+      if (g.enabled) {
+        var muted = groupManualMutedCount(g);
+        return muted > 0 && muted < g.indices.length;
+      }
+      var unmuted = groupForcedEnabledCount(g);
+      return unmuted > 0 && unmuted < g.indices.length;
+    }
+    function syncGroupCheckboxVisual(key) {
+      var g = groupState.get(key);
+      if (!g || !groupsEl) return;
+      var cb = groupsEl.querySelector('input[type="checkbox"][data-group-key="' + key + '"]');
+      if (!cb) return;
+      cb.checked = !!g.enabled;
+      cb.indeterminate = isGroupPartiallyMuted(g);
+    }
+    function syncAllGroupCheckboxVisuals() {
+      groupState.forEach(function (_, key) { syncGroupCheckboxVisual(key); });
+    }
 
     function reapplyGroupMutes() {
       groupState.forEach(function (g) {
         if (!g.enabled) {
           g.indices.forEach(function (i) {
             if (!bank[i]) return;
-            setSavedForIndex(i, bank[i].amp);
-            bank[i].amp = 0;
+            if (isRowForceEnabled(i)) {
+              setSavedForIndex(i, bank[i].amp);
+            } else {
+              setSavedForIndex(i, bank[i].amp);
+              bank[i].amp = 0;
+            }
           });
         }
       });
+      applyRowManualMutes();
+      syncAllGroupCheckboxVisuals();
       updateAmpUI(true); setMasterFromSum(); refreshWaveDebounced();
     }
 
@@ -415,13 +514,33 @@
       var N = maxHarmonicsFor(base);
       bankEl.innerHTML = '';
       bank = Array.from({ length: N }, function (_, i) {
-        var n = i + 1, f = Math.round(partialFreq(n, base));
+        var n = i + 1;
         var row = document.createElement('div'); row.className = 'bank-row';
         var tint = groupTintForIndex(i);
         row.style.setProperty('--group-h', String(tint.h));
         row.style.setProperty('--group-s', String(tint.s) + '%');
         row.style.setProperty('--group-l', String(tint.l) + '%');
-        var title = document.createElement('div'); title.className = 'bank-title'; title.textContent = 'n=' + n + ' | f~ ' + f + ' Hz';
+        var title = document.createElement('div'); title.className = 'bank-title'; title.textContent = partialTitleText(n, base);
+        var muteBtn = document.createElement('button'); muteBtn.type = 'button'; muteBtn.className = 'row-mute';
+        muteBtn.textContent = isRowEffectivelyMuted(i) ? 'Unmute' : 'Mute';
+        muteBtn.addEventListener('click', function () { toggleRowMute(i); });
+        var key = groupKeyForIndex(i);
+        var gNow = groupState.get(key);
+        var groupEnabledNow = !gNow || gNow.enabled;
+        var groupMuteBtn = document.createElement('button'); groupMuteBtn.type = 'button'; groupMuteBtn.className = 'row-mute';
+        groupMuteBtn.textContent = groupToggleButtonTextForIndex(i, base, groupEnabledNow);
+        groupMuteBtn.classList.toggle('is-unmute', !groupEnabledNow);
+        groupMuteBtn.title = 'Toggle this row group';
+        groupMuteBtn.addEventListener('click', function () {
+          var key2 = groupKeyForIndex(i);
+          var g2 = groupState.get(key2);
+          var enabled = !g2 || g2.enabled;
+          onGroupToggle(key2, !enabled);
+        });
+        var head = document.createElement('div'); head.className = 'bank-head';
+        head.appendChild(title);
+        head.appendChild(muteBtn);
+        head.appendChild(groupMuteBtn);
 
         var slider = document.createElement('input'); slider.type = 'range'; slider.min = '0'; slider.max = String(AMP_MAX); slider.step = '0.0001';
         // NEW: default amp for brand new partials is 0 (not 0.3), we'll redistribute explicitly
@@ -440,14 +559,20 @@
           if (presetMode !== 'custom') presetMode = 'custom';
           userTouchedAmps = true;
           var newA = parseFloat(slider.value);
+          if (newA > AMP_EPS && isRowManuallyMuted(i)) rowMuteSaved.delete(i);
           onAmpChange(i, newA);
           syncCoeffsToAmpsNormalized();
         });
 
         bankEl.appendChild(row);
-        row.appendChild(title); row.appendChild(slider); row.appendChild(ampEl); row.appendChild(coeffEl);
-        return { idx: n, coeff: coeffInit, amp: ampInit, rowEl: row, titleEl: title, sliderEl: slider, ampEl: ampEl, coeffEl: coeffEl };
+        row.appendChild(head); row.appendChild(slider); row.appendChild(ampEl); row.appendChild(coeffEl);
+        return {
+          idx: n, coeff: coeffInit, amp: ampInit, rowEl: row, titleEl: title,
+          muteBtnEl: muteBtn, groupMuteBtnEl: groupMuteBtn, sliderEl: slider, ampEl: ampEl, coeffEl: coeffEl
+        };
       });
+      pruneRowMuteSaved();
+      pruneRowForceEnabled();
       lastMaxN = N;
       rebuildGroups(base);
       if (!opts.skipFit) {
@@ -460,8 +585,14 @@
 
     function updateBankTitlesOnly(base) {
       bank.forEach(function (cell, i) {
-        var n = i + 1, f = Math.round(partialFreq(n, base));
-        cell.titleEl.textContent = 'n=' + n + ' | f~ ' + f + ' Hz';
+        var n = i + 1;
+        cell.titleEl.textContent = partialTitleText(n, base);
+        if (cell.groupMuteBtnEl) {
+          var g = groupState.get(groupKeyForIndex(i));
+          var groupEnabled = !g || g.enabled;
+          cell.groupMuteBtnEl.textContent = groupToggleButtonTextForIndex(i, base, groupEnabled);
+          cell.groupMuteBtnEl.classList.toggle('is-unmute', !groupEnabled);
+        }
       });
       renderGroups(base);
     }
@@ -469,14 +600,30 @@
     function onAmpChange(pivotIdx, newAmp) {
       if (!Array.isArray(bank) || bank.length === 0) return;
       if (pivotIdx < 0 || pivotIdx >= bank.length || !bank[pivotIdx]) return;
+      var nextAmp = clamp(newAmp, 0, AMP_MAX);
+      var key = groupKeyForIndex(pivotIdx);
+      if (nextAmp > AMP_EPS && isRowManuallyMuted(pivotIdx)) rowMuteSaved.delete(pivotIdx);
 
-      bank[pivotIdx].amp = clamp(newAmp, 0, AMP_MAX);
+      if (!isIndexEnabled(pivotIdx)) {
+        // Editing a muted partial should change its stored value and keep audible amp muted.
+        setSavedForIndex(pivotIdx, nextAmp);
+        bank[pivotIdx].amp = 0;
+        updateAmpUI(true);
+        setMasterFromSum();
+        syncGroupCheckboxVisual(key);
+        refreshWaveDebounced();
+        return;
+      }
+
+      bank[pivotIdx].amp = nextAmp;
+      if (isRowForceEnabled(pivotIdx)) setSavedForIndex(pivotIdx, bank[pivotIdx].amp);
       var s = sumAmps();
       if (s > ABS_CAP + 1e-12) { enforceCap(pivotIdx, ABS_CAP); }
       else { updateAmpUI(); setMasterFromSum(); }
 
       // Keep coeffs in sync with user intent
       syncCoeffsToAmpsNormalized();
+      syncGroupCheckboxVisual(key);
 
       // Rebuild (debounced) only if needed (e.g., harmonic mode)
       refreshWaveDebounced();
@@ -528,10 +675,24 @@
     function updateAmpUI(adjustSliders) {
       adjustSliders = !!adjustSliders;
       var sA = sumAmps();
-      bank.forEach(function (cell) {
+      bank.forEach(function (cell, i) {
         if (!cell) return;
-        cell.ampEl.textContent = 'Amp: ' + toPct(cell.amp);
-        if (adjustSliders && cell.sliderEl) cell.sliderEl.value = cell.amp.toFixed(4);
+        var shownAmp = isIndexEnabled(i) ? cell.amp : getUnderlyingAmp(i);
+        cell.ampEl.textContent = 'Amp: ' + toPct(shownAmp);
+        if (adjustSliders && cell.sliderEl) cell.sliderEl.value = shownAmp.toFixed(4);
+        if (cell.muteBtnEl) {
+          var muted = isRowEffectivelyMuted(i);
+          cell.muteBtnEl.textContent = muted ? 'Unmute' : 'Mute';
+          cell.muteBtnEl.classList.toggle('is-unmute', muted);
+          cell.muteBtnEl.setAttribute('aria-pressed', muted ? 'true' : 'false');
+        }
+        if (cell.groupMuteBtnEl) {
+          var g = groupState.get(groupKeyForIndex(i));
+          var groupEnabled = !g || g.enabled;
+          cell.groupMuteBtnEl.textContent = groupToggleButtonTextForIndex(i, Number(freqNum.value), groupEnabled);
+          cell.groupMuteBtnEl.classList.toggle('is-unmute', !groupEnabled);
+          cell.groupMuteBtnEl.setAttribute('aria-pressed', !groupEnabled ? 'true' : 'false');
+        }
       });
       var sC = (sumCoeffs() * 100).toFixed(2);
       var label = (presetMode === 'custom' ? (presetBase || 'custom') : presetMode) + (userTouchedAmps ? ' (tweaked)' : '');
@@ -540,6 +701,8 @@
 
     function applyPreset(kind) {
       if (!Array.isArray(bank) || bank.length === 0) { presetMode = kind; presetBase = kind; return; }
+      rowMuteSaved.clear();
+      rowForceEnabled.clear();
       if (kind === 'saw') {
         presetMode = 'saw'; presetBase = 'saw'; userTouchedAmps = false;
         bank.forEach(function (cell, i) { var c = 1 / (i + 1); cell.coeff = c; if (cell.coeffEl) cell.coeffEl.textContent = 'Coeff: ' + toPct(c); });
@@ -731,6 +894,8 @@
         for (var n = p; n <= N; n *= 2) { var f = Math.round(partialFreq(n, Number(freqNum.value))); freqs.push(f); }
         var wrap = document.createElement('label'); wrap.className = 'group'; wrap.title = 'n=' + p + '*2^k';
         var cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = g.enabled; cb.addEventListener('change', function () { onGroupToggle(key, cb.checked); });
+        cb.setAttribute('data-group-key', key);
+        cb.indeterminate = isGroupPartiallyMuted(g);
         var txt = document.createElement('span');
         txt.textContent = (p === 1 ? 'n=1 octaves: ' : ('n=' + p + ' octaves: ')) + (freqs.length ? (freqs.join(', ') + ' Hz') : '(none in range)');
         wrap.appendChild(cb); wrap.appendChild(txt);
@@ -746,13 +911,26 @@
     function onGroupToggle(key, enabled) {
       var g = groupState.get(key); if (!g) return; g.enabled = enabled;
       if (!enabled) {
-        g.indices.forEach(function (i) { if (!bank[i]) return; var underlying = getUnderlyingAmp(i); g.saved.set(i, underlying); bank[i].amp = 0; });
+        g.indices.forEach(function (i) {
+          if (!bank[i]) return;
+          var underlying = getUnderlyingAmp(i);
+          g.saved.set(i, underlying);
+          rowForceEnabled.delete(i);
+          bank[i].amp = 0;
+        });
         updateAmpUI(true); setMasterFromSum(); refreshWaveDebounced();
       } else {
-        g.indices.forEach(function (i) { if (!bank[i]) return; var saved = g.saved.get(i); if (typeof saved === 'number') bank[i].amp = clamp(saved, 0, AMP_MAX); });
+        g.indices.forEach(function (i) {
+          if (!bank[i]) return;
+          rowForceEnabled.delete(i);
+          var saved = g.saved.get(i);
+          if (typeof saved === 'number') bank[i].amp = clamp(saved, 0, AMP_MAX);
+        });
+        applyRowManualMutes();
         if (sumAmps() > ABS_CAP + 1e-12) enforceCap(-1, ABS_CAP);
         updateAmpUI(true); setMasterFromSum(); refreshWaveDebounced();
       }
+      syncGroupCheckboxVisual(key);
       updateGroupsToggleAllLabel();
     }
 
@@ -760,24 +938,24 @@
       // Remember bulk mode for future (new) groups
       window.groupsDefaultEnabled = !!enabled;
 
-      groupState.forEach(function (g) { g.enabled = !!enabled; });
-
       if (!enabled) {
-        // Bulk mute: save underlying then zero
-        bank.forEach(function (cell, i) {
-          var underlying = getUnderlyingAmp(i);
-          setSavedForIndex(i, underlying);
-          cell.amp = 0;
+        // Act like clicking "Mute" on every row one-by-one.
+        bank.forEach(function (_, i) {
+          if (!isRowEffectivelyMuted(i)) toggleRowMute(i);
         });
+        rowForceEnabled.clear();
+        groupState.forEach(function (g) { g.enabled = false; });
       } else {
-        // Bulk enable: restore saved where available
-        bank.forEach(function (cell, i) {
-          var sv = getSavedForIndex(i);
-          if (typeof sv === 'number') cell.amp = clamp(sv, 0, AMP_MAX);
+        // Act like clicking "Unmute" on every row one-by-one.
+        bank.forEach(function (_, i) {
+          if (isRowEffectivelyMuted(i)) toggleRowMute(i);
         });
-        if (sumAmps() > ABS_CAP + 1e-12) enforceCap(-1, ABS_CAP);
+        groupState.forEach(function (g) { g.enabled = true; });
+        rowForceEnabled.clear();
+        rowMuteSaved.clear();
       }
 
+      if (sumAmps() > ABS_CAP + 1e-12) enforceCap(-1, ABS_CAP);
       updateAmpUI(true);
       setMasterFromSum();
       refreshWaveDebounced();
@@ -787,7 +965,6 @@
 
 
     toggleBtn.addEventListener('click', async function () {
-      applyPreset("saw")
       await ensureContext();
       if (currentEngine) { stopEngine(); }
       else { startEngine(); }

@@ -26,11 +26,12 @@
       display: grid;
       place-items: center;
       height: 100%;
-      padding: 24px;
+      padding: 8px;
     }
 
     .card {
-      width: min(1180px, 100%);
+      width: 100%;
+      max-width: none;
       background: linear-gradient(180deg, rgba(255, 255, 255, .04), rgba(255, 255, 255, .02));
       backdrop-filter: blur(6px);
       border: 1px solid rgba(255, 255, 255, .08);
@@ -178,7 +179,7 @@
       --group-s: 72%;
       --group-l: 58%;
       display: grid;
-      grid-template-columns: minmax(300px, 1fr) minmax(300px, 520px) 180px 180px;
+      grid-template-columns: minmax(420px, 1.35fr) minmax(460px, 2.65fr) 170px 170px;
       gap: 12px;
       align-items: center;
       background:
@@ -191,9 +192,31 @@
     }
 
     .bank-title {
+      flex: 0 0 auto;
+      width: fit-content;
+      white-space: nowrap;
       color: hsla(var(--group-h), 86%, 84%, 1)
     }
-
+    .bank-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .row-mute {
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, .08);
+      border: 1px solid rgba(255, 255, 255, .2);
+      box-shadow: none;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }
+    .row-mute.is-unmute {
+      background: linear-gradient(180deg, #ffbe63, #f39a2e);
+      color: #2b1700;
+      border-color: rgba(0, 0, 0, .2);
+    }
     #groups {
       display: flex;
       flex-wrap: wrap;
